@@ -494,3 +494,138 @@ where
         eprintln!("Error in async processing for '{}': {}", source_name, e);
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::{process_feed_sync, GLOBAL_COUNTER, OUTPUT_SUBDIR};
+    use serde_json::Value;
+    use std::env;
+    use std::fs;
+    use std::io::Cursor;
+    use std::path::PathBuf;
+    use std::sync::Mutex;
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    static TEST_MUTEX: Mutex<()> = Mutex::new(());
+
+    fn init_output_dir() -> PathBuf {
+        let base = env::temp_dir()
+            .join("feedparser-csb-tests")
+            .join(
+                SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+                    .to_string(),
+            );
+
+        if let Some(existing) = OUTPUT_SUBDIR.get().cloned() {
+            // Reuse the existing directory but clean it to avoid cross-test contamination
+            let _ = fs::remove_dir_all(&existing);
+            fs::create_dir_all(&existing).unwrap();
+            return existing;
+        }
+
+        fs::create_dir_all(&base).unwrap();
+        let _ = OUTPUT_SUBDIR.set(base.clone());
+        base
+    }
+
+    fn reset_counter() {
+        GLOBAL_COUNTER.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn read_json(path: &PathBuf) -> Value {
+        let content = fs::read_to_string(path).expect("failed to read JSON output");
+        serde_json::from_str(&content).expect("failed to parse JSON output")
+    }
+
+    #[test]
+    fn writes_blank_record_when_xml_missing() {
+        let _guard = TEST_MUTEX.lock().unwrap();
+        let output_dir = init_output_dir();
+        reset_counter();
+
+        let input = format!(
+            "{lm}\n{etag}\n{url}\n{dl}\n   \n",
+            lm = 1,
+            etag = "[[NO_ETAG]]",
+            url = "https://example.com/feed.xml",
+            dl = 2
+        );
+
+        process_feed_sync(Cursor::new(input.into_bytes()), "test.txt", Some(42));
+
+        let output_path = output_dir.join("1_newsfeeds_42.json");
+        assert!(output_path.exists(), "newsfeeds JSON file should be created");
+
+        let json = read_json(&output_path);
+        assert_eq!(json["table"], "newsfeeds");
+        assert_eq!(json["columns"], Value::from(vec!["feed_id", "title", "link", "description"]));
+        assert_eq!(json["values"], Value::from(vec![42, "", "", ""]));
+        assert_eq!(json["feed_id"], Value::from(42));
+    }
+
+    #[test]
+    fn writes_channel_and_item_records() {
+        let _guard = TEST_MUTEX.lock().unwrap();
+        let output_dir = init_output_dir();
+        reset_counter();
+
+        let xml_body = r#"<?xml version=\"1.0\" encoding=\"UTF-8\"?>
+<rss version=\"2.0\" xmlns:itunes=\"http://www.itunes.com/dtds/podcast-1.0.dtd\" xmlns:podcast=\"https://podcastindex.org/namespace/1.0\">
+    <channel>
+        <title>Sample Channel</title>
+        <link>https://example.com</link>
+        <description>Channel description</description>
+        <item>
+            <title>Episode 1</title>
+            <link>https://example.com/episode1</link>
+            <description>First episode</description>
+            <pubDate>Fri, 01 Jan 2021 00:00:00 GMT</pubDate>
+            <itunes:image href=\"https://example.com/img.jpg\" />
+            <podcast:funding url=\"https://example.com/support\">Support us</podcast:funding>
+        </item>
+    </channel>
+</rss>"#;
+
+        let input = format!(
+            "{lm}\n{etag}\n{url}\n{dl}\n{xml}\n",
+            lm = 1,
+            etag = "etag123",
+            url = "https://example.com/feed.xml",
+            dl = 2,
+            xml = xml_body
+        );
+
+        process_feed_sync(Cursor::new(input.into_bytes()), "42_200.txt", Some(7));
+
+        let item_path = output_dir.join("1_nfitems_7.json");
+        let channel_path = output_dir.join("2_newsfeeds_7.json");
+        assert!(item_path.exists(), "nfitems JSON should be created first");
+        assert!(channel_path.exists(), "newsfeeds JSON should be created second");
+
+        let item_json = read_json(&item_path);
+        assert_eq!(item_json["table"], "nfitems");
+        assert_eq!(
+            item_json["values"],
+            Value::from(vec![
+                7,
+                "Episode 1",
+                "https://example.com/episode1",
+                "First episode",
+                "Fri, 01 Jan 2021 00:00:00 GMT",
+                "https://example.com/img.jpg",
+                "https://example.com/support",
+                "Support us",
+            ])
+        );
+
+        let channel_json = read_json(&channel_path);
+        assert_eq!(channel_json["table"], "newsfeeds");
+        assert_eq!(
+            channel_json["values"],
+            Value::from(vec![7, "Sample Channel", "https://example.com", "Channel description"])
+        );
+    }
+}
